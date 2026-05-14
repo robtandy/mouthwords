@@ -119,7 +119,7 @@ class _PanelController(NSObject):
         status.setDrawsBackground_(False)
         status.setEditable_(False)
         status.setSelectable_(False)
-        status.setFont_(NSFont.systemFontOfSize_ofWeight_(13, 0.3))
+        status.setFont_(NSFont.systemFontOfSize_weight_(13, 0.3))
         status.setTextColor_(_rec_color())
         status.setStringValue_("●  recording")
         effect.addSubview_(status)
