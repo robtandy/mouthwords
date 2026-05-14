@@ -11,6 +11,7 @@ or a chord like "ctrl+cmd+\\", "cmd+shift+space".
 from __future__ import annotations
 
 import os
+import re
 import sys
 import threading
 import time
@@ -30,6 +31,54 @@ RESUME_WINDOW = float(os.environ.get("MOUTHWORDS_RESUME_WINDOW", "30"))
 MODEL_NAME = os.environ.get("MOUTHWORDS_MODEL", "base.en")
 HOTKEY_SPEC = os.environ.get("MOUTHWORDS_HOTKEY", "ctrl+cmd+\\")
 SHOW_UI = os.environ.get("MOUTHWORDS_UI", "1").lower() not in ("0", "false", "no")
+
+REWRITES_ENABLED = os.environ.get("MOUTHWORDS_REWRITES", "1").lower() not in ("0", "false", "no")
+
+# Word/phrase → symbol substitutions applied after every transcribe pass.
+# Whisper is a natural-speech model — it always spells out "underscore",
+# "open paren", etc. These rewrites turn the speech form into the symbol.
+# Compiled once at import; word-boundary anchored so they don't match
+# inside larger words.
+SYMBOL_REWRITES = [
+    (re.compile(r"\bunderscore\b", re.IGNORECASE), "_"),
+    (re.compile(r"\basterisk\b", re.IGNORECASE), "*"),
+    (re.compile(r"\btilde\b", re.IGNORECASE), "~"),
+    (re.compile(r"\bcaret\b", re.IGNORECASE), "^"),
+    (re.compile(r"\bampersand\b", re.IGNORECASE), "&"),
+    (re.compile(r"\bbackslash\b", re.IGNORECASE), r"\\"),
+    (re.compile(r"\bpipe\b", re.IGNORECASE), "|"),
+    (re.compile(r"\bat\s+sign\b", re.IGNORECASE), "@"),
+    (re.compile(r"\b(?:hash|pound)\s+sign\b", re.IGNORECASE), "#"),
+    (re.compile(r"\bdollar\s+sign\b", re.IGNORECASE), "$"),
+    (re.compile(r"\bpercent\s+sign\b", re.IGNORECASE), "%"),
+    (re.compile(r"\bplus\s+sign\b", re.IGNORECASE), "+"),
+    (re.compile(r"\bequals\s+sign\b", re.IGNORECASE), "="),
+    (re.compile(r"\bopen\s+paren(?:thesis)?\b", re.IGNORECASE), "("),
+    (re.compile(r"\bclose\s+paren(?:thesis)?\b", re.IGNORECASE), ")"),
+    (re.compile(r"\bopen\s+bracket\b", re.IGNORECASE), "["),
+    (re.compile(r"\bclose\s+bracket\b", re.IGNORECASE), "]"),
+    (re.compile(r"\bopen\s+(?:brace|curly)\b", re.IGNORECASE), "{"),
+    (re.compile(r"\bclose\s+(?:brace|curly)\b", re.IGNORECASE), "}"),
+]
+
+
+def rewrite_symbols(text: str) -> str:
+    """Run the SYMBOL_REWRITES list over text and tidy up spacing.
+
+    'foo underscore bar' → 'foo _ bar' after substitution → 'foo_bar' after
+    cleanup. Spacing inside brackets is also tightened (so 'open paren x'
+    becomes '(x' not '( x').
+    """
+    if not REWRITES_ENABLED:
+        return text
+    out = text
+    for pattern, repl in SYMBOL_REWRITES:
+        out = pattern.sub(repl, out)
+    out = re.sub(r"(?<=\w)\s*_\s*(?=\w)", "_", out)
+    out = re.sub(r"([(\[{])\s+", r"\1", out)
+    out = re.sub(r"\s+([)\]}])", r"\1", out)
+    return out
+
 
 MOD_KEYS = {
     "ctrl": {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r},
@@ -249,7 +298,7 @@ def stop_and_transcribe() -> None:
     _set_status("✍️  transcribing...")
     t0 = time.time()
     segments = _transcribe(audio)
-    text = " ".join(s.text for s in segments).strip()
+    text = rewrite_symbols(" ".join(s.text for s in segments).strip())
     elapsed = time.time() - t0
     _hide_panel()
     if not text:
@@ -294,7 +343,7 @@ def _live_transcribe_loop() -> None:
             continue
         if not recording:
             return
-        text = " ".join(s.text for s in segments).strip()
+        text = rewrite_symbols(" ".join(s.text for s in segments).strip())
         if text and text != last_text:
             last_text = text
             _set_transcript(text)

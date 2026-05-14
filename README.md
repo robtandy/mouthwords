@@ -45,6 +45,23 @@ Environment variables:
 | `MOUTHWORDS_RESUME_WINDOW` | `30` | Seconds within which a new recording inherits the previous transcript as whisper's `initial_prompt` for continuity. |
 | `MOUTHWORDS_UI` | `1` | Set `0` to disable the floating panel and run headless. Streaming text into the focused window still works. |
 | `MOUTHWORDS_PANEL_ALPHA` | `0.82` | Panel transparency (0.0–1.0). Lower = more see-through. |
+| `MOUTHWORDS_REWRITES` | `1` | Substitute spoken symbol names with the actual character (`underscore` → `_`, `open paren` → `(`, …). Set `0` to disable. |
+
+### Symbol rewrites
+
+Whisper transcribes natural speech, so it writes the word "underscore" when you say it. A post-processing pass converts the common code symbols:
+
+| Say | Get |
+|---|---|
+| underscore | `_` |
+| asterisk | `*` |
+| tilde, caret, ampersand, pipe, backslash | `~ ^ & \| \` |
+| at sign, hash sign, pound sign, dollar sign, percent sign, plus sign, equals sign | `@ # # $ % + =` |
+| open / close paren (parenthesis) | `( )` |
+| open / close bracket | `[ ]` |
+| open / close brace (curly) | `{ }` |
+
+Spacing inside `x_y`, `(x)`, `[x]`, `{x}` is tightened automatically. Disable via `MOUTHWORDS_REWRITES=0` if you need the literal words.
 
 Example:
 
