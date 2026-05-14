@@ -488,21 +488,34 @@ def ensure_permissions() -> None:
 def _install_sigint_watcher() -> None:
     """Make Ctrl-C terminate the process reliably.
 
-    AppHelper.runEventLoop blocks the main thread in CFRunLoopRun, which
-    prevents Python's normal signal handler from running. The portable
-    fix: block SIGINT on the main thread (mask is inherited by spawned
-    threads), then have a dedicated watcher thread sigwait for it and
-    hard-exit. Must be called before any other threads are spawned.
+    AppHelper.runEventLoop blocks the main thread in CFRunLoopRun, so
+    Python's signal handler (which runs at the next bytecode boundary)
+    never fires. Use signal.set_wakeup_fd: Python's C-level signal
+    handler also writes the signal number into a pipe — that write
+    happens from kernel signal-context, asynchronous to whatever the
+    main thread is doing. A dedicated watcher thread blocks on the
+    read end of the pipe and hard-exits when a byte arrives.
+
+    sigwait + pthread_sigmask was tried first but proved fragile —
+    PortAudio's audio threads can unblock SIGINT and absorb it before
+    our watcher sees it pending.
     """
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+    r, w = os.pipe()
+    os.set_blocking(w, False)
+    signal.set_wakeup_fd(w, warn_on_full_buffer=False)
+    # No-op Python handlers; we only need Python's signal module to
+    # accept the signals so the C-level handler keeps writing to the
+    # wakeup fd.
+    signal.signal(signal.SIGINT, lambda *_: None)
+    signal.signal(signal.SIGTERM, lambda *_: None)
 
     def _watcher() -> None:
-        sig = signal.sigwait({signal.SIGINT, signal.SIGTERM})
-        print(f"\nshutting down (signal {sig})", flush=True)
+        sig_byte = os.read(r, 1)
+        sig_num = sig_byte[0] if sig_byte else 0
+        print(f"\nshutting down (signal {sig_num})", flush=True)
         os._exit(130)
 
-    t = threading.Thread(target=_watcher, daemon=True, name="sigint-watcher")
-    t.start()
+    threading.Thread(target=_watcher, daemon=True, name="sigint-watcher").start()
 
 
 def main() -> None:
@@ -558,11 +571,11 @@ def main() -> None:
             menu.addItem_(quit_item)
             status_item.setMenu_(menu)
 
-            # installInterrupt=True wires SIGINT via a mach port so Ctrl-C
-            # in the launching terminal actually terminates the run loop;
-            # without it, Python's signal handler never runs because the
-            # main thread is blocked in CFRunLoopRun.
-            AppHelper.runEventLoop(installInterrupt=True)
+            # Don't pass installInterrupt=True — pyobjc replaces our
+            # signal handlers with its own mach-interrupt setup, which is
+            # less reliable. _install_sigint_watcher already wired our
+            # own SIGINT path before the run loop started.
+            AppHelper.runEventLoop()
         except ImportError as e:
             print(
                 f"warning: UI disabled ({e}). Set MOUTHWORDS_UI=0 to silence.",
