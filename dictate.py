@@ -24,8 +24,12 @@ from pywhispercpp.model import Model
 SAMPLE_RATE = 16000
 MIN_SECONDS = 0.3
 MAX_SECONDS = float(os.environ.get("MOUTHWORDS_MAX_SECONDS", "120"))
+SILENCE_THRESHOLD = float(os.environ.get("MOUTHWORDS_SILENCE_THRESHOLD", "0.008"))
+SILENCE_SECONDS = float(os.environ.get("MOUTHWORDS_SILENCE_SECONDS", "1.5"))
+LIVE_INTERVAL = float(os.environ.get("MOUTHWORDS_LIVE_INTERVAL", "1.2"))
 MODEL_NAME = os.environ.get("MOUTHWORDS_MODEL", "base.en")
 HOTKEY_SPEC = os.environ.get("MOUTHWORDS_HOTKEY", "ctrl+cmd+\\")
+SHOW_UI = os.environ.get("MOUTHWORDS_UI", "1").lower() not in ("0", "false", "no")
 
 MOD_KEYS = {
     "ctrl": {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r},
@@ -86,13 +90,22 @@ def matches_trigger(key, trigger) -> bool:
 REQUIRED_MODS, TRIGGER = parse_hotkey(HOTKEY_SPEC)
 
 state_lock = threading.Lock()
+model_lock = threading.Lock()
 recording = False
 held_mods: set[str] = set()
 trigger_down = False
 frames: list[np.ndarray] = []
 stream: sd.InputStream | None = None
 watchdog: threading.Timer | None = None
+live_thread: threading.Thread | None = None
+
+# Silence detection state
+speech_started = False
+last_speech_time = 0.0
+silence_triggered = False
+
 kb = keyboard.Controller()
+panel = None  # populated in main() if SHOW_UI
 
 
 def chord_active() -> bool:
@@ -100,12 +113,60 @@ def chord_active() -> bool:
 
 
 def audio_callback(indata, _frames, _time, _status):
+    global speech_started, last_speech_time, silence_triggered
     frames.append(indata.copy())
+    if silence_triggered or not recording:
+        return
+    rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+    now = time.time()
+    if rms > SILENCE_THRESHOLD:
+        if not speech_started:
+            speech_started = True
+        last_speech_time = now
+    elif speech_started and (now - last_speech_time) > SILENCE_SECONDS:
+        silence_triggered = True
+        threading.Thread(target=_silence_stop, daemon=True).start()
+
+
+def _silence_stop() -> None:
+    global recording
+    with state_lock:
+        if not recording:
+            return
+        recording = False
+    print("(silence detected)", flush=True)
+    stop_and_transcribe()
+
+
+def _set_status(text: str) -> None:
+    if panel is not None:
+        panel.set_status(text)
+
+
+def _set_transcript(text: str) -> None:
+    if panel is not None:
+        panel.set_transcript(text)
+
+
+def _show_panel() -> None:
+    if panel is not None:
+        panel.set_status("🎤 recording...")
+        panel.set_transcript("")
+        panel.show()
+
+
+def _hide_panel() -> None:
+    if panel is not None:
+        panel.hide()
 
 
 def start_recording() -> None:
-    global stream, frames, watchdog
+    global stream, frames, watchdog, live_thread
+    global speech_started, last_speech_time, silence_triggered
     frames = []
+    speech_started = False
+    last_speech_time = time.time()
+    silence_triggered = False
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=audio_callback
     )
@@ -115,6 +176,9 @@ def start_recording() -> None:
     )
     watchdog.daemon = True
     watchdog.start()
+    live_thread = threading.Thread(target=_live_transcribe_loop, daemon=True)
+    live_thread.start()
+    _show_panel()
     print("recording...", flush=True)
 
 
@@ -140,26 +204,68 @@ def abort_recording(reason: str) -> None:
             return
         recording = False
     _teardown_stream()
+    _hide_panel()
     print(f"aborted: {reason}", flush=True)
 
 
 def stop_and_transcribe() -> None:
     if not _teardown_stream():
+        _hide_panel()
         return
     audio = np.concatenate(frames, axis=0).flatten().astype(np.float32)
     duration = len(audio) / SAMPLE_RATE
     if duration < MIN_SECONDS:
+        _hide_panel()
         print(f"(too short: {duration:.2f}s)", flush=True)
         return
+    _set_status("✍️  transcribing...")
     t0 = time.time()
-    segments = model.transcribe(audio)
+    with model_lock:
+        segments = model.transcribe(audio)
     text = " ".join(s.text for s in segments).strip()
     elapsed = time.time() - t0
+    _hide_panel()
     if not text:
         print(f"(no speech, {elapsed:.2f}s)", flush=True)
         return
     print(f"[{elapsed:.2f}s] {text}", flush=True)
     paste(text)
+
+
+def _live_transcribe_loop() -> None:
+    """Periodically re-transcribe the accumulated audio and push to the panel."""
+    if panel is None:
+        return
+    last_text = ""
+    last_run = time.time()
+    while True:
+        time.sleep(0.1)
+        if not recording:
+            return
+        if time.time() - last_run < LIVE_INTERVAL:
+            continue
+        if not frames:
+            continue
+        snapshot = list(frames)
+        audio = np.concatenate(snapshot, axis=0).flatten().astype(np.float32)
+        if len(audio) < SAMPLE_RATE * 0.5:
+            continue
+        last_run = time.time()
+        # Skip if the user already stopped while we were waiting
+        if not recording:
+            return
+        try:
+            with model_lock:
+                if not recording:
+                    return
+                segments = model.transcribe(audio)
+        except Exception as e:
+            print(f"(live transcribe error: {e})", flush=True)
+            continue
+        text = " ".join(s.text for s in segments).strip()
+        if text and text != last_text:
+            last_text = text
+            _set_transcript(text)
 
 
 def paste(text: str) -> None:
@@ -204,14 +310,24 @@ def on_release(key) -> None:
         threading.Thread(target=stop_and_transcribe, daemon=True).start()
 
 
-def ensure_permissions() -> None:
-    """Block startup until macOS permissions look usable.
+def user_stop_clicked() -> None:
+    """Called from the panel's Stop button (main thread). Spawn worker so UI stays responsive."""
+    global recording
+    with state_lock:
+        if not recording:
+            return
+        recording = False
+    threading.Thread(target=stop_and_transcribe, daemon=True).start()
 
-    Accessibility is checked via the official AX API, which also shows the
-    system 'allow accessibility' dialog when missing. Microphone access is
-    probed by briefly opening a stream — that triggers the standard mic
-    prompt on first run, and raises on denial after.
-    """
+
+def user_cancel_clicked() -> None:
+    threading.Thread(
+        target=lambda: abort_recording("cancel button"), daemon=True
+    ).start()
+
+
+def ensure_permissions() -> None:
+    """Block startup until macOS permissions look usable."""
     try:
         from ApplicationServices import (
             AXIsProcessTrustedWithOptions,
@@ -248,12 +364,34 @@ def ensure_permissions() -> None:
 
 
 def main() -> None:
-    global model
+    global model, panel
     ensure_permissions()
     print(f"loading model '{MODEL_NAME}' (first run downloads it)...", flush=True)
     model = Model(MODEL_NAME, print_realtime=False, print_progress=False)
     print(f"ready. hold {HOTKEY_SPEC} to dictate. ctrl-c to quit.", flush=True)
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.daemon = True
+    listener.start()
+
+    if SHOW_UI:
+        try:
+            from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+            from PyObjCTools import AppHelper
+
+            from ui import Panel
+
+            app = NSApplication.sharedApplication()
+            app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+            panel = Panel(on_stop=user_stop_clicked, on_cancel=user_cancel_clicked)
+            AppHelper.runEventLoop()
+        except ImportError as e:
+            print(
+                f"warning: UI disabled ({e}). Set MOUTHWORDS_UI=0 to silence.",
+                flush=True,
+            )
+            listener.join()
+    else:
         listener.join()
 
 
