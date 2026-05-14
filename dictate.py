@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """mouthwords: hold a hotkey to dictate, release to type into the focused app.
 
-Defaults: hold Right Option to record. Release to transcribe and paste.
+Default hotkey: Ctrl+Cmd+\\ (push-to-talk). Release to transcribe and paste.
 Override with env vars: MOUTHWORDS_MODEL, MOUTHWORDS_HOTKEY.
+
+MOUTHWORDS_HOTKEY accepts either a single pynput Key name ("alt_r", "f13")
+or a chord like "ctrl+cmd+\\", "cmd+shift+space".
 """
 
 from __future__ import annotations
@@ -21,23 +24,77 @@ from pywhispercpp.model import Model
 SAMPLE_RATE = 16000
 MIN_SECONDS = 0.3
 MODEL_NAME = os.environ.get("MOUTHWORDS_MODEL", "base.en")
-HOTKEY_NAME = os.environ.get("MOUTHWORDS_HOTKEY", "alt_r")
+HOTKEY_SPEC = os.environ.get("MOUTHWORDS_HOTKEY", "ctrl+cmd+\\")
+
+MOD_KEYS = {
+    "ctrl": {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r},
+    "cmd": {keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r},
+    "shift": {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r},
+    "alt": {keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r},
+}
+MOD_ALIASES = {
+    "ctrl": "ctrl", "control": "ctrl",
+    "cmd": "cmd", "command": "cmd", "meta": "cmd",
+    "shift": "shift",
+    "alt": "alt", "option": "alt", "opt": "alt",
+}
 
 
-def resolve_hotkey(name: str) -> keyboard.Key:
-    try:
-        return getattr(keyboard.Key, name)
-    except AttributeError:
-        sys.exit(f"Unknown hotkey '{name}'. Try one of: alt_r, alt_l, ctrl_r, f13, f14")
+def parse_hotkey(spec: str) -> tuple[set[str], object]:
+    """Parse 'ctrl+cmd+\\' or 'alt_r' into (required_mods, trigger_key)."""
+    parts = [p.strip() for p in spec.split("+") if p.strip()]
+    if not parts:
+        sys.exit(f"empty hotkey spec '{spec}'")
+    *mod_parts, trigger_part = parts
+    required = set()
+    for m in mod_parts:
+        key = MOD_ALIASES.get(m.lower())
+        if key is None:
+            sys.exit(f"unknown modifier '{m}' in hotkey '{spec}'")
+        required.add(key)
+    tp = trigger_part
+    if hasattr(keyboard.Key, tp):
+        trigger = getattr(keyboard.Key, tp)
+    elif len(tp) == 1:
+        trigger = keyboard.KeyCode.from_char(tp)
+    else:
+        sys.exit(
+            f"unknown trigger key '{tp}' in hotkey '{spec}'. "
+            "Use a pynput Key name (alt_r, f13, space) or a single character."
+        )
+    return required, trigger
 
 
-HOTKEY = resolve_hotkey(HOTKEY_NAME)
+def key_to_mod(key) -> str | None:
+    for name, keys in MOD_KEYS.items():
+        if key in keys:
+            return name
+    return None
+
+
+def matches_trigger(key, trigger) -> bool:
+    if key == trigger:
+        return True
+    # Char-based fallback: pynput may report KeyCode(char=...) with vk set,
+    # while our trigger from from_char has vk=None — so compare chars directly.
+    a = getattr(key, "char", None)
+    b = getattr(trigger, "char", None)
+    return a is not None and a == b
+
+
+REQUIRED_MODS, TRIGGER = parse_hotkey(HOTKEY_SPEC)
 
 state_lock = threading.Lock()
 recording = False
+held_mods: set[str] = set()
+trigger_down = False
 frames: list[np.ndarray] = []
 stream: sd.InputStream | None = None
 kb = keyboard.Controller()
+
+
+def chord_active() -> bool:
+    return REQUIRED_MODS.issubset(held_mods) and trigger_down
 
 
 def audio_callback(indata, _frames, _time, _status):
@@ -88,25 +145,34 @@ def paste(text: str) -> None:
 
 
 def on_press(key) -> None:
-    global recording
-    if key != HOTKEY:
-        return
-    with state_lock:
-        if recording:
-            return
-        recording = True
-    start_recording()
+    global recording, trigger_down
+    mod = key_to_mod(key)
+    if mod:
+        held_mods.add(mod)
+    if matches_trigger(key, TRIGGER):
+        trigger_down = True
+    if chord_active():
+        with state_lock:
+            if recording:
+                return
+            recording = True
+        start_recording()
 
 
 def on_release(key) -> None:
-    global recording
-    if key != HOTKEY:
-        return
-    with state_lock:
-        if not recording:
-            return
-        recording = False
-    threading.Thread(target=stop_and_transcribe, daemon=True).start()
+    global recording, trigger_down
+    was_active = chord_active()
+    mod = key_to_mod(key)
+    if mod:
+        held_mods.discard(mod)
+    if matches_trigger(key, TRIGGER):
+        trigger_down = False
+    if was_active and not chord_active():
+        with state_lock:
+            if not recording:
+                return
+            recording = False
+        threading.Thread(target=stop_and_transcribe, daemon=True).start()
 
 
 def ensure_permissions() -> None:
@@ -157,7 +223,7 @@ def main() -> None:
     ensure_permissions()
     print(f"loading model '{MODEL_NAME}' (first run downloads it)...", flush=True)
     model = Model(MODEL_NAME, print_realtime=False, print_progress=False)
-    print(f"ready. hold {HOTKEY_NAME} to dictate. ctrl-c to quit.", flush=True)
+    print(f"ready. hold {HOTKEY_SPEC} to dictate. ctrl-c to quit.", flush=True)
     with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
         listener.join()
 
