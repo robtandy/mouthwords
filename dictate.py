@@ -536,7 +536,11 @@ def main() -> None:
             menu.addItem_(quit_item)
             status_item.setMenu_(menu)
 
-            AppHelper.runEventLoop()
+            # installInterrupt=True wires SIGINT via a mach port so Ctrl-C
+            # in the launching terminal actually terminates the run loop;
+            # without it, Python's signal handler never runs because the
+            # main thread is blocked in CFRunLoopRun.
+            AppHelper.runEventLoop(installInterrupt=True)
         except ImportError as e:
             print(
                 f"warning: UI disabled ({e}). Set MOUTHWORDS_UI=0 to silence.",
