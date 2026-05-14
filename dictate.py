@@ -109,8 +109,52 @@ def on_release(key) -> None:
     threading.Thread(target=stop_and_transcribe, daemon=True).start()
 
 
+def ensure_permissions() -> None:
+    """Block startup until macOS permissions look usable.
+
+    Accessibility is checked via the official AX API, which also shows the
+    system 'allow accessibility' dialog when missing. Microphone access is
+    probed by briefly opening a stream — that triggers the standard mic
+    prompt on first run, and raises on denial after.
+    """
+    try:
+        from ApplicationServices import (
+            AXIsProcessTrustedWithOptions,
+            kAXTrustedCheckOptionPrompt,
+        )
+    except ImportError:
+        print(
+            "warning: pyobjc-framework-ApplicationServices not installed; "
+            "skipping accessibility check",
+            flush=True,
+        )
+    else:
+        if not AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True}):
+            sys.exit(
+                "Accessibility permission required to simulate paste.\n"
+                "A system dialog should have appeared; if not, open:\n"
+                "  System Settings → Privacy & Security → Accessibility\n"
+                "and enable the app running this script (e.g. Terminal, iTerm).\n"
+                "Then re-run."
+            )
+
+    try:
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="float32"
+        ):
+            time.sleep(0.05)
+    except Exception as e:
+        sys.exit(
+            f"Microphone access failed: {e}\n"
+            "Grant Microphone permission in:\n"
+            "  System Settings → Privacy & Security → Microphone\n"
+            "Then re-run."
+        )
+
+
 def main() -> None:
     global model
+    ensure_permissions()
     print(f"loading model '{MODEL_NAME}' (first run downloads it)...", flush=True)
     model = Model(MODEL_NAME, print_realtime=False, print_progress=False)
     print(f"ready. hold {HOTKEY_NAME} to dictate. ctrl-c to quit.", flush=True)
