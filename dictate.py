@@ -23,6 +23,7 @@ from pywhispercpp.model import Model
 
 SAMPLE_RATE = 16000
 MIN_SECONDS = 0.3
+MAX_SECONDS = float(os.environ.get("MOUTHWORDS_MAX_SECONDS", "120"))
 MODEL_NAME = os.environ.get("MOUTHWORDS_MODEL", "base.en")
 HOTKEY_SPEC = os.environ.get("MOUTHWORDS_HOTKEY", "ctrl+cmd+\\")
 
@@ -90,6 +91,7 @@ held_mods: set[str] = set()
 trigger_down = False
 frames: list[np.ndarray] = []
 stream: sd.InputStream | None = None
+watchdog: threading.Timer | None = None
 kb = keyboard.Controller()
 
 
@@ -102,23 +104,47 @@ def audio_callback(indata, _frames, _time, _status):
 
 
 def start_recording() -> None:
-    global stream, frames
+    global stream, frames, watchdog
     frames = []
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=audio_callback
     )
     stream.start()
+    watchdog = threading.Timer(
+        MAX_SECONDS, lambda: abort_recording(f"hit {MAX_SECONDS:g}s limit")
+    )
+    watchdog.daemon = True
+    watchdog.start()
     print("recording...", flush=True)
 
 
-def stop_and_transcribe() -> None:
-    global stream
+def _teardown_stream() -> bool:
+    """Stop the stream and cancel the watchdog. Returns True iff frames captured."""
+    global stream, watchdog
+    if watchdog is not None:
+        watchdog.cancel()
+        watchdog = None
     if stream is None:
-        return
+        return False
     stream.stop()
     stream.close()
     stream = None
-    if not frames:
+    return bool(frames)
+
+
+def abort_recording(reason: str) -> None:
+    """Drop the current recording without transcribing. Safe from any thread."""
+    global recording
+    with state_lock:
+        if not recording:
+            return
+        recording = False
+    _teardown_stream()
+    print(f"aborted: {reason}", flush=True)
+
+
+def stop_and_transcribe() -> None:
+    if not _teardown_stream():
         return
     audio = np.concatenate(frames, axis=0).flatten().astype(np.float32)
     duration = len(audio) / SAMPLE_RATE
@@ -146,6 +172,9 @@ def paste(text: str) -> None:
 
 def on_press(key) -> None:
     global recording, trigger_down
+    if key == keyboard.Key.esc and recording:
+        abort_recording("escape pressed")
+        return
     mod = key_to_mod(key)
     if mod:
         held_mods.add(mod)

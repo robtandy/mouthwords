@@ -12,7 +12,9 @@ Requires Python 3.10+ and a Mac.
 
 That's it. `run.sh` is idempotent: it creates the venv on first run, installs deps only when `requirements.txt` changes, then launches the app. The first run also downloads the Whisper model (~150MB for `base.en`).
 
-**Hold Ctrl+Cmd+\\** to record. **Release** to transcribe and paste into the focused window.
+**Hold Ctrl+Cmd+\\** to record. **Release** to transcribe and paste into the focused window. **Press Esc** while recording to abort without transcribing.
+
+A safety watchdog also auto-aborts recordings longer than `MOUTHWORDS_MAX_SECONDS` (default 120) in case macOS misses a key release.
 
 ## macOS permissions
 
@@ -32,6 +34,7 @@ Environment variables:
 |---|---|---|
 | `MOUTHWORDS_MODEL` | `base.en` | Any whisper.cpp model name: `tiny.en`, `base.en`, `small.en`, `medium.en`, `large-v3` |
 | `MOUTHWORDS_HOTKEY` | `ctrl+cmd+\` | Either a single [`pynput.keyboard.Key`](https://pynput.readthedocs.io/en/latest/keyboard.html#pynput.keyboard.Key) name (`alt_r`, `f13`) or a chord (`ctrl+cmd+\`, `cmd+shift+space`). Modifiers: `ctrl`, `cmd`, `shift`, `alt`. |
+| `MOUTHWORDS_MAX_SECONDS` | `120` | Hard cap on a single recording. Auto-aborts if exceeded (catches stuck states when macOS drops a key-release event). |
 
 Example:
 
