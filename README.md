@@ -2,23 +2,15 @@
 
 Hold a hotkey, talk, release — your words get typed into whatever app has focus. 100% local, runs on Apple Silicon using [whisper.cpp](https://github.com/ggml-org/whisper.cpp).
 
-## Setup
-
-Requires Python 3.10+ and a Mac (uses `pbcopy` and macOS keyboard APIs).
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
 ## Run
 
+Requires Python 3.10+ and a Mac.
+
 ```bash
-python dictate.py
+./run.sh
 ```
 
-The first run downloads the Whisper model (~150MB for `base.en`).
+That's it. `run.sh` is idempotent: it creates the venv on first run, installs deps only when `requirements.txt` changes, then launches the app. The first run also downloads the Whisper model (~150MB for `base.en`).
 
 **Hold Right Option** to record. **Release** to transcribe and paste into the focused window.
 
@@ -44,7 +36,7 @@ Environment variables:
 Example:
 
 ```bash
-MOUTHWORDS_MODEL=small.en MOUTHWORDS_HOTKEY=f13 python dictate.py
+MOUTHWORDS_MODEL=small.en MOUTHWORDS_HOTKEY=f13 ./run.sh
 ```
 
 ## Notes
