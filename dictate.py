@@ -11,7 +11,6 @@ or a chord like "ctrl+cmd+\\", "cmd+shift+space".
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -25,8 +24,9 @@ SAMPLE_RATE = 16000
 MIN_SECONDS = 0.3
 MAX_SECONDS = float(os.environ.get("MOUTHWORDS_MAX_SECONDS", "120"))
 SILENCE_THRESHOLD = float(os.environ.get("MOUTHWORDS_SILENCE_THRESHOLD", "0.008"))
-SILENCE_SECONDS = float(os.environ.get("MOUTHWORDS_SILENCE_SECONDS", "1.5"))
+SILENCE_SECONDS = float(os.environ.get("MOUTHWORDS_SILENCE_SECONDS", "20.0"))
 LIVE_INTERVAL = float(os.environ.get("MOUTHWORDS_LIVE_INTERVAL", "1.2"))
+RESUME_WINDOW = float(os.environ.get("MOUTHWORDS_RESUME_WINDOW", "30"))
 MODEL_NAME = os.environ.get("MOUTHWORDS_MODEL", "base.en")
 HOTKEY_SPEC = os.environ.get("MOUTHWORDS_HOTKEY", "ctrl+cmd+\\")
 SHOW_UI = os.environ.get("MOUTHWORDS_UI", "1").lower() not in ("0", "false", "no")
@@ -91,6 +91,7 @@ REQUIRED_MODS, TRIGGER = parse_hotkey(HOTKEY_SPEC)
 
 state_lock = threading.Lock()
 model_lock = threading.Lock()
+typed_lock = threading.Lock()
 recording = False
 held_mods: set[str] = set()
 trigger_down = False
@@ -103,6 +104,15 @@ live_thread: threading.Thread | None = None
 speech_started = False
 last_speech_time = 0.0
 silence_triggered = False
+
+# Streaming-type state. typed_text is what we've sent to the focused window for
+# the current recording; we diff each new transcript against it and backspace/
+# type the delta. Cross-recording continuity comes from last_session_text +
+# last_session_end, which feed the next transcribe call as initial_prompt.
+typed_text = ""
+current_session_prompt = ""
+last_session_text = ""
+last_session_end = 0.0
 
 kb = keyboard.Controller()
 panel = None  # populated in main() if SHOW_UI
@@ -161,12 +171,22 @@ def _hide_panel() -> None:
 
 
 def start_recording() -> None:
-    global stream, frames, watchdog, live_thread
+    global stream, frames, watchdog, live_thread, typed_text
     global speech_started, last_speech_time, silence_triggered
+    global current_session_prompt
     frames = []
+    typed_text = ""
     speech_started = False
     last_speech_time = time.time()
     silence_triggered = False
+    if last_session_text and (time.time() - last_session_end) < RESUME_WINDOW:
+        current_session_prompt = _trim_prompt(last_session_text)
+        print(
+            f"resuming from previous session ({len(current_session_prompt)} char prompt)",
+            flush=True,
+        )
+    else:
+        current_session_prompt = ""
     stream = sd.InputStream(
         samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=audio_callback
     )
@@ -197,18 +217,25 @@ def _teardown_stream() -> bool:
 
 
 def abort_recording(reason: str) -> None:
-    """Drop the current recording without transcribing. Safe from any thread."""
+    """Drop the current recording without transcribing. Safe from any thread.
+
+    Also backspaces any partial text that the live loop already streamed into
+    the focused window — Cancel/Esc should leave the target app as if the
+    dictation never happened.
+    """
     global recording
     with state_lock:
         if not recording:
             return
         recording = False
     _teardown_stream()
+    emit_text_update("")
     _hide_panel()
     print(f"aborted: {reason}", flush=True)
 
 
 def stop_and_transcribe() -> None:
+    global last_session_text, last_session_end
     if not _teardown_stream():
         _hide_panel()
         return
@@ -220,22 +247,28 @@ def stop_and_transcribe() -> None:
         return
     _set_status("✍️  transcribing...")
     t0 = time.time()
-    with model_lock:
-        segments = model.transcribe(audio)
+    segments = _transcribe(audio)
     text = " ".join(s.text for s in segments).strip()
     elapsed = time.time() - t0
     _hide_panel()
     if not text:
         print(f"(no speech, {elapsed:.2f}s)", flush=True)
         return
+    emit_text_update(text)
+    # Snapshot for resume: prior context + this recording's text.
+    prior = current_session_prompt
+    last_session_text = (prior + " " + text).strip() if prior else text
+    last_session_end = time.time()
     print(f"[{elapsed:.2f}s] {text}", flush=True)
-    paste(text)
 
 
 def _live_transcribe_loop() -> None:
-    """Periodically re-transcribe the accumulated audio and push to the panel."""
-    if panel is None:
-        return
+    """Periodically re-transcribe the accumulated audio.
+
+    Pushes the latest text to the panel (if any) and streams it into the
+    focused window via emit_text_update so the user sees words appear as
+    they speak.
+    """
     last_text = ""
     last_run = time.time()
     while True:
@@ -251,29 +284,67 @@ def _live_transcribe_loop() -> None:
         if len(audio) < SAMPLE_RATE * 0.5:
             continue
         last_run = time.time()
-        # Skip if the user already stopped while we were waiting
         if not recording:
             return
         try:
-            with model_lock:
-                if not recording:
-                    return
-                segments = model.transcribe(audio)
+            segments = _transcribe(audio)
         except Exception as e:
             print(f"(live transcribe error: {e})", flush=True)
             continue
+        if not recording:
+            return
         text = " ".join(s.text for s in segments).strip()
         if text and text != last_text:
             last_text = text
             _set_transcript(text)
+            emit_text_update(text)
 
 
-def paste(text: str) -> None:
-    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
-    time.sleep(0.05)
-    with kb.pressed(keyboard.Key.cmd):
-        kb.press("v")
-        kb.release("v")
+def emit_text_update(new_text: str) -> None:
+    """Stream a transcript update into the focused window.
+
+    Diffs new_text against what's already been typed this recording and emits
+    backspaces + new characters so revisions from whisper are reflected
+    instead of duplicated. Newlines/tabs are flattened to spaces because
+    those keys are submit/indent in many target apps.
+    """
+    global typed_text
+    new_text = new_text.replace("\n", " ").replace("\r", "").replace("\t", " ")
+    with typed_lock:
+        old = typed_text
+        if new_text == old:
+            return
+        i = 0
+        n = min(len(old), len(new_text))
+        while i < n and old[i] == new_text[i]:
+            i += 1
+        backspaces = len(old) - i
+        addition = new_text[i:]
+        for _ in range(backspaces):
+            kb.press(keyboard.Key.backspace)
+            kb.release(keyboard.Key.backspace)
+        if addition:
+            kb.type(addition)
+        typed_text = new_text
+
+
+def _trim_prompt(text: str, max_chars: int = 500) -> str:
+    """Whisper's initial_prompt has a token cap (~224 tokens). Keep ~500 chars."""
+    if len(text) <= max_chars:
+        return text
+    trimmed = text[-max_chars:]
+    if " " in trimmed:
+        trimmed = trimmed[trimmed.index(" ") + 1:]
+    return trimmed
+
+
+def _transcribe(audio: np.ndarray):
+    """Run whisper, optionally with the previous session's text as prompt."""
+    kwargs = {}
+    if current_session_prompt:
+        kwargs["initial_prompt"] = current_session_prompt
+    with model_lock:
+        return model.transcribe(audio, **kwargs)
 
 
 def on_press(key) -> None:
