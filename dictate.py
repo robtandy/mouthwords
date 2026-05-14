@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import sys
 import threading
 import time
@@ -484,8 +485,29 @@ def ensure_permissions() -> None:
         )
 
 
+def _install_sigint_watcher() -> None:
+    """Make Ctrl-C terminate the process reliably.
+
+    AppHelper.runEventLoop blocks the main thread in CFRunLoopRun, which
+    prevents Python's normal signal handler from running. The portable
+    fix: block SIGINT on the main thread (mask is inherited by spawned
+    threads), then have a dedicated watcher thread sigwait for it and
+    hard-exit. Must be called before any other threads are spawned.
+    """
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+
+    def _watcher() -> None:
+        sig = signal.sigwait({signal.SIGINT, signal.SIGTERM})
+        print(f"\nshutting down (signal {sig})", flush=True)
+        os._exit(130)
+
+    t = threading.Thread(target=_watcher, daemon=True, name="sigint-watcher")
+    t.start()
+
+
 def main() -> None:
     global model, panel
+    _install_sigint_watcher()
     ensure_permissions()
     print(f"loading model '{MODEL_NAME}' (first run downloads it)...", flush=True)
     model = Model(MODEL_NAME, print_realtime=False, print_progress=False)
