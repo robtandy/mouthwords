@@ -11,12 +11,12 @@ the main NSOperationQueue, since AppKit must only be touched from main.
 
 from __future__ import annotations
 
+import os
 from typing import Callable
 
 import objc
 from AppKit import (
     NSBackingStoreBuffered,
-    NSBezelStyleRegularSquare,
     NSBezelStyleRounded,
     NSButton,
     NSColor,
@@ -30,20 +30,20 @@ from AppKit import (
     NSTextField,
     NSTextView,
     NSVisualEffectBlendingModeBehindWindow,
-    NSVisualEffectMaterialHUDWindow,
+    NSVisualEffectMaterialPopover,
     NSVisualEffectStateActive,
     NSVisualEffectView,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorTransient,
     NSWindowStyleMaskBorderless,
     NSWindowStyleMaskNonactivatingPanel,
-    NSWindowStyleMaskResizable,
 )
 from Foundation import NSObject, NSOperationQueue
 
 
 PANEL_W, PANEL_H = 480, 200
 CORNER_RADIUS = 14.0
+PANEL_ALPHA = float(os.environ.get("MOUTHWORDS_PANEL_ALPHA", "0.82"))
 
 
 def _on_main(fn: Callable[[], None]) -> None:
@@ -93,12 +93,14 @@ class _PanelController(NSObject):
         panel.setBackgroundColor_(NSColor.clearColor())
         panel.setHasShadow_(True)
         panel.setMovableByWindowBackground_(True)
+        panel.setAlphaValue_(PANEL_ALPHA)
 
         # Vibrancy background as the content view, with rounded corners.
+        # Popover material is lighter and more translucent than HUDWindow.
         effect = NSVisualEffectView.alloc().initWithFrame_(
             NSMakeRect(0, 0, PANEL_W, PANEL_H)
         )
-        effect.setMaterial_(NSVisualEffectMaterialHUDWindow)
+        effect.setMaterial_(NSVisualEffectMaterialPopover)
         effect.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
         effect.setState_(NSVisualEffectStateActive)
         effect.setWantsLayer_(True)

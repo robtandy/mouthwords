@@ -44,6 +44,7 @@ Environment variables:
 | `MOUTHWORDS_LIVE_INTERVAL` | `1.2` | Seconds between live-transcript refreshes (also how often new text gets streamed into the focused window). |
 | `MOUTHWORDS_RESUME_WINDOW` | `30` | Seconds within which a new recording inherits the previous transcript as whisper's `initial_prompt` for continuity. |
 | `MOUTHWORDS_UI` | `1` | Set `0` to disable the floating panel and run headless. Streaming text into the focused window still works. |
+| `MOUTHWORDS_PANEL_ALPHA` | `0.82` | Panel transparency (0.0–1.0). Lower = more see-through. |
 
 Example:
 

@@ -116,6 +116,7 @@ last_session_end = 0.0
 
 kb = keyboard.Controller()
 panel = None  # populated in main() if SHOW_UI
+status_item = None  # NSStatusItem, held module-level so pyobjc doesn't free it
 
 
 def chord_active() -> bool:
@@ -447,7 +448,15 @@ def main() -> None:
 
     if SHOW_UI:
         try:
-            from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+            from AppKit import (
+                NSApp,
+                NSApplication,
+                NSApplicationActivationPolicyAccessory,
+                NSMenu,
+                NSMenuItem,
+                NSStatusBar,
+                NSVariableStatusItemLength,
+            )
             from PyObjCTools import AppHelper
 
             from ui import Panel
@@ -455,6 +464,29 @@ def main() -> None:
             app = NSApplication.sharedApplication()
             app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
             panel = Panel(on_stop=user_stop_clicked, on_cancel=user_cancel_clicked)
+
+            # Menu bar status item. Held module-level (status_item global) so
+            # ARC/pyobjc doesn't deallocate it.
+            global status_item
+            status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+                NSVariableStatusItemLength
+            )
+            status_item.button().setTitle_("🎤")
+            status_item.button().setToolTip_(f"mouthwords — hold {HOTKEY_SPEC} to dictate")
+            menu = NSMenu.alloc().init()
+            menu.addItem_(
+                NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    f"hold {HOTKEY_SPEC} to dictate", None, ""
+                )
+            )
+            menu.addItem_(NSMenuItem.separatorItem())
+            quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Quit mouthwords", "terminate:", "q"
+            )
+            quit_item.setTarget_(NSApp)
+            menu.addItem_(quit_item)
+            status_item.setMenu_(menu)
+
             AppHelper.runEventLoop()
         except ImportError as e:
             print(
